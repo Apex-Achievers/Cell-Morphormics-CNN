@@ -1,0 +1,148 @@
+import argparse
+import glob
+import os
+import sys
+import subprocess
+
+import matplotlib.pyplot as plt
+import numpy as np
+import PIL.Image
+
+import tensorflow.compat.v1 as tf
+import tf_slim as slim
+
+# Clone TF models repository for Inception V4 if needed
+SLIM_PATH = os.path.join('models', 'research', 'slim')
+if not os.path.exists(SLIM_PATH):
+    subprocess.check_call(['git', 'clone', 'https://github.com/tensorflow/models/'])
+    
+sys.path.append(SLIM_PATH)
+from nets import inception
+
+# -----------------------------------------------------------------------------
+# Constants & Book-keeping
+NUM_STAINS = 4
+STAIN_NAMES = ["MitoTracker", "LysoTracker", "TMRM", "Hoechst"]
+STAIN_ORDER = [0, 1, 2, 3]
+SIZE_OF_EMBEDDING = 64 * NUM_STAINS
+
+DATA_DIR = os.path.expanduser('~/Embeddings/')
+RANDOM_PROJECTION_CKPT = os.path.join(DATA_DIR, 'random_projection/random_projection.ckpt')
+INCEPTION_V4_CKPT = 'inception_v4.ckpt'
+
+# -----------------------------------------------------------------------------
+# Helper functions
+
+def load_image(file_path):
+    with PIL.Image.open(file_path) as im:
+        return np.asarray(im)
+
+def build_inceptionv4_rand64_tower(inputs, is_training=False):
+    """Builds an inception v4 backbone with a random 64-D projection head."""
+    with slim.arg_scope(inception.inception_v4_arg_scope()):
+        _, activations = inception.inception_v4(inputs['images'],
+                                               num_classes=1001,
+                                               is_training=is_training)
+        net = activations['PreLogitsFlatten']
+        with slim.arg_scope([slim.fully_connected], activation_fn=None):
+            net = slim.fully_connected(net, 64, scope='fc0')
+            activations['fc0'] = net
+            net = tf.nn.l2_normalize(net, dim=-1, name='embed_norm')
+            net = tf.reshape(net, [-1, 64])
+            activations['embed_norm'] = net
+    return net, activations
+
+# -----------------------------------------------------------------------------
+# Main script
+
+def main(argv=None):
+    global DATA_DIR, RANDOM_PROJECTION_CKPT
+    parser = argparse.ArgumentParser(description='Generate embeddings for microscopy stains.')
+    parser.add_argument('--images', required=True,
+                        help='Directory containing exactly {} grayscale PNG images.'.format(NUM_STAINS))
+    parser.add_argument('--data_dir', default=DATA_DIR,
+                        help='Base directory containing random projection checkpoint.')
+    parser.add_argument('--fresh_random_projection', action='store_true',
+                        help='Reinitialize fc0 layer before restoring checkpoint.')
+    args = parser.parse_args(argv)
+
+    DATA_DIR = os.path.expanduser(args.data_dir)
+    RANDOM_PROJECTION_CKPT = os.path.join(DATA_DIR, 'random_projection/random_projection.ckpt')
+
+    png_paths = sorted(glob.glob(os.path.join(args.images, '*.png')))
+    assert len(png_paths) == NUM_STAINS, (
+        f"Expected {NUM_STAINS} stain images, found {len(png_paths)}")
+
+    np_images = []
+    plt.figure(figsize=(20, 15))
+    for i, img_path in enumerate(png_paths):
+        np_images.append(load_image(img_path))
+        plt.subplot(1, len(png_paths), i + 1)
+        plt.imshow(np_images[-1], cmap='gray')
+        plt.title(STAIN_NAMES[i])
+    np_images = np.array(np_images)
+    np_images = np.expand_dims(np_images, axis=3)
+    IMG_HEIGHT, IMG_WIDTH = np_images.shape[1:3]
+    print(np_images.shape)
+
+    IMAGE_KEY = 'images'
+    graph = tf.Graph()
+    with graph.as_default():
+        images_ph = tf.placeholder(tf.float32, shape=(None, IMG_HEIGHT, IMG_WIDTH, 1))
+        images_small = tf.image.resize_images(images_ph, [299, 299], method=tf.image.ResizeMethod.AREA)
+        images_small /= 255.0
+        images_small -= 0.5
+        images_small *= 2.0
+        epsilon = 0.01
+        assert_min = tf.assert_greater_equal(tf.reduce_min(images_small), -(1 + epsilon))
+        assert_max = tf.assert_less_equal(tf.reduce_max(images_small), (1 + epsilon))
+        with tf.control_dependencies([assert_min, assert_max]):
+            images_small = tf.identity(images_small)
+
+        single_stain_images = tf.tile(images_small, [1, 1, 1, 3])
+        inputs = {IMAGE_KEY: single_stain_images}
+        embed, _ = build_inceptionv4_rand64_tower(inputs, is_training=False)
+
+        assignment_inception_map = {}
+        assignment_projection_map = {}
+
+        for v in slim.get_model_variables():
+            if v.op.name.startswith('InceptionV4'):
+                assignment_inception_map[v.op.name] = v.op.name
+            else:
+                if not (args.fresh_random_projection and v.op.name.startswith('fc0')):
+                    assignment_projection_map[v.op.name] = v.op.name
+
+        tf.train.init_from_checkpoint(INCEPTION_V4_CKPT, assignment_inception_map)
+        tf.train.init_from_checkpoint(RANDOM_PROJECTION_CKPT, assignment_projection_map)
+
+        single_stain_embeds = tf.split(embed, NUM_STAINS)
+        stain_concat_embed = tf.concat(single_stain_embeds, 1)
+
+        sess = tf.Session(graph=graph)
+        saver = tf.train.Saver()
+        init_op = tf.global_variables_initializer()
+        sess.run(init_op)
+
+        if args.fresh_random_projection:
+            fc0_vars = [v for v in slim.get_model_variables('fc0')]
+            initializer = tf.random_normal_initializer(seed=42)
+            for v in fc0_vars:
+                sess.run(tf.assign(v, initializer(shape=v.shape)))
+
+    def get_ordered_embeddings(input_imgs):
+        stain_embeds, concat_embed = sess.run(
+            [single_stain_embeds, stain_concat_embed],
+            feed_dict={images_ph: input_imgs})
+        ordered = np.concatenate(
+            [stain_embeds[i] for i in STAIN_ORDER], axis=1)
+        return ordered
+
+    embeds = get_ordered_embeddings(np_images)
+    print(embeds[0][:10])
+    plt.figure(figsize=(30, 10))
+    plt.plot(embeds.T, 'b-o')
+    plt.show()
+
+if __name__ == '__main__':
+    main()
